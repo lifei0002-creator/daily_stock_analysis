@@ -65,6 +65,7 @@ from src.agent.news_evidence import (
     reset_news_evidence_scope,
 )
 from src.services.empty_news import news_evidence_present
+from src.services.stock_news_fallback import run_stock_news_fallback
 from src.formatters import strip_hidden_markdown_metadata
 from src.phase_decision_guardrail import apply_phase_decision_guardrails
 from src.services.daily_market_context import (
@@ -687,6 +688,8 @@ class StockAnalysisPipeline:
             )
             news_result_count: Optional[int] = None
             self._emit_progress(46, f"{stock_name}：正在检索新闻与舆情")
+            # 东财个股新闻兜底是否已尝试（搜索不可用分支内尝试一次；零命中分支不再重复调用）
+            fallback_news_attempted = False
             if self.search_service is not None and self.search_service.is_available:
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
 
@@ -731,6 +734,22 @@ class StockAnalysisPipeline:
                         logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
             else:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
+                # 东财个股新闻兜底（a-stock-data §5.1，Apache 2.0）：搜索不可用时，
+                # 用免费的东财个股新闻接口补最近消息；失败返回空上下文，绝不阻断主流程。
+                fallback_news_attempted = True
+                news_context, news_result_count = run_stock_news_fallback(
+                    code=code, stock_name=stock_name, market=market, is_index=is_index
+                )
+            if (
+                not fallback_news_attempted
+                and news_result_count == 0
+                and market == "cn"
+                and not is_index
+            ):
+                # 搜索已启用但零命中时同样走兜底（SearXNG 公共实例不可靠时最常见的形态）
+                news_context, news_result_count = run_stock_news_fallback(
+                    code=code, stock_name=stock_name, market=market, is_index=is_index
+                )
 
             # Step 4.5: Social sentiment intelligence (US stocks only)
             social_evidence_context: Optional[str] = None
