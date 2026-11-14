@@ -17,9 +17,10 @@ BaostockFetcher - 备用数据源 2 (Priority 3)
 import logging
 import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Generator
 
+import numpy as np
 import pandas as pd
 from tenacity import (
     retry,
@@ -38,6 +39,7 @@ from .base import (
     _is_hk_market,
 )
 import os
+from .realtime_types import ChipDistribution
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,109 @@ def _is_us_code(stock_code: str) -> bool:
     """
     code = stock_code.strip().upper()
     return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
+
+
+# ----------------------------------------------------------------------
+# 筹码分布本地推演（移植自 simonlin1212/a-stock-data SKILL.md §4.6，
+# Apache 2.0，原作者 simonlin1212；函数体逐字移植，仅改名）
+# 东财没有公开 CYQ 接口（作者实测 push2 cyq/get 均 404），故本地推演。
+# ----------------------------------------------------------------------
+
+
+def _triangular_weights(grid: np.ndarray, low: float, high: float, avg: float) -> np.ndarray:
+    """当日筹码在价格网格上的三角分布权重（峰值在均价，面积归一）"""
+    w = np.zeros_like(grid)
+    if not np.isfinite([low, high, avg]).all() or high < low:
+        return w
+    if high - low < 1e-9:                       # 一字板：全部堆在一个价位
+        w[np.argmin(np.abs(grid - low))] = 1.0
+        return w
+    avg = min(max(avg, low), high)              # 均价必须落在当日区间内
+    left = (grid >= low) & (grid <= avg)
+    right = (grid > avg) & (grid <= high)
+    if avg - low > 1e-9:
+        w[left] = (grid[left] - low) / (avg - low)
+    else:
+        w[left] = 1.0
+    if high - avg > 1e-9:
+        w[right] = (high - grid[right]) / (high - avg)
+    else:
+        w[right] = 1.0
+    total = w.sum()
+    if total > 0:
+        return w / total
+    # 兜底：当日振幅窄于网格步长时，可能一个网格点都没落进 [low, high]，
+    #    权重会全为 0。若就此跳过该日，连它的换手衰减也会一并丢失 ——
+    #    低波动标的（银行股等）+ 长窗口下这会累积成很大的偏差。映射到最近网格点。
+    w[np.argmin(np.abs(grid - avg))] = 1.0
+    return w
+
+
+def _chip_distribution_local(df: pd.DataFrame, grid_size: int = 300, decay: float = 1.0) -> dict:
+    """筹码分布 — df 需含 date/high/low/close/turn（turn 为百分数，0.31 表示 0.31%）
+
+    decay: 换手衰减系数。1.0=按真实换手率换手；同花顺口径常用 1.5~2.0 加快历史筹码消散。
+    """
+    # 必须带 date 并按时间升序：换手衰减是有方向的时序递推，
+    # 若传入常见的「最新在前」倒序，衰减会反向推、且 close.iloc[-1] 会把最老的
+    # 收盘价当成现价 —— 结果完全错却不会报错。这里强制要求 date 并自行排序。
+    need = {"date", "high", "low", "close", "turn"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"chip_distribution 缺少列: {sorted(missing)}（date 用于强制时间升序）")
+    d = df.dropna(subset=["high", "low", "close", "turn"]).copy()
+    d = d[d["high"] > 0]
+    if d.empty:
+        raise ValueError("chip_distribution: 有效行数为 0（检查是否全是停牌日，或字段类型不对）")
+    d = d.sort_values("date").reset_index(drop=True)
+
+    lo, hi = float(d["low"].min()), float(d["high"].max())
+    pad = (hi - lo) * 0.02 or max(lo * 0.02, 0.01)
+    grid = np.linspace(lo - pad, hi + pad, grid_size)
+
+    # 初始筹码必须播种成「首日全部流通盘」，不能从全零开始。
+    # 从零起步等于假设窗口之前没有任何持仓，再把窗口内的少量换手归一化成 100%：
+    # 两个 1% 换手日（价 10 和 100）会被算成约 50/50，而真实情况是约 99% 仍在 10 附近。
+    chips = None
+    for row in d.itertuples(index=False):
+        t = float(row.turn) / 100.0 * decay
+        t = min(max(t, 0.0), 1.0)               # 换手率兜到 [0,1]，防异常值把筹码一次清零
+        avg = (float(row.high) + float(row.low) + float(row.close)) / 3.0
+        w = _triangular_weights(grid, float(row.low), float(row.high), avg)
+        if w.sum() <= 0:
+            continue
+        if chips is None:
+            chips = w.copy()                    # 首日分布 = 期初全部流通筹码
+            continue
+        chips = chips * (1.0 - t) + w * t
+    if chips is None:
+        raise RuntimeError("chip_distribution: 所有交易日的价格区间都无效，无法构建分布")
+
+    total = chips.sum()
+    if total <= 0:
+        raise RuntimeError("chip_distribution: 筹码总量为 0，无法计算指标")
+    chips = chips / total
+
+    price = float(d["close"].iloc[-1])
+    cum = np.cumsum(chips)
+
+    def price_at(q: float) -> float:
+        return float(np.interp(q, cum, grid))
+
+    p05, p15, p85, p95 = (price_at(q) for q in (0.05, 0.15, 0.85, 0.95))
+    peak_i = int(np.argmax(chips))
+    return {
+        "price": price,
+        "profit_ratio": float(chips[grid <= price].sum()),      # 获利比例
+        "avg_cost": float((grid * chips).sum()),                # 平均成本
+        "cost_90": (p05, p95),
+        "cost_70": (p15, p85),
+        "concentration_90": float((p95 - p05) / (p95 + p05)) if p95 + p05 else None,
+        "concentration_70": float((p85 - p15) / (p85 + p15)) if p85 + p15 else None,
+        "peak_price": float(grid[peak_i]),                      # 筹码峰
+        "histogram": [(float(pp), float(cc)) for pp, cc in zip(grid, chips) if cc > 1e-6],
+    }
+
 
 
 class BaostockFetcher(BaseFetcher):
@@ -373,6 +478,98 @@ class BaostockFetcher(BaseFetcher):
             logger.warning(f"Baostock 获取股票列表失败: {e}")
         
         return None
+
+    # ------------------------------------------------------------------
+    # 筹码分布（a-stock-data §4.6 移植，Apache 2.0，原作者 simonlin1212）
+    # ------------------------------------------------------------------
+    # 定位：DataFetcherManager.get_chip_distribution 按 priority 遍历 fetcher，
+    # akshare（priority 1，stock_cyq_em）失败/返回空时自动落到本方法（priority 3）。
+    # 本方法是“兜底”而非替换：Variables 里 ENABLE_CHIP_DISTRIBUTION=true 时，
+    # akshare 路径仍优先；只有它拿不到时才走 Baostock 本地计算。
+
+    CHIP_HISTORY_CALENDAR_DAYS = 400  # 约 250 个交易日，见 PLAN.md §2.3
+    CHIP_MIN_TRADING_DAYS = 60        # 有效交易日低于此数，播种占主导，结果不可信
+    CHIP_GRID_SIZE = 300
+    CHIP_DECAY = 1.0                  # 1.0=按真实换手率换手
+
+    def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
+        """Baostock 本地筹码分布（CYQ 推演）。
+
+        取最近约 400 日历日（约 250 交易日）前复权 K 线 + 换手率，
+        按换手率衰减逐日递推、当日成交按三角分布撒进 [low, high]，
+        算出获利比例 / 平均成本 / 90% 与 70% 成本区间及集中度。
+
+        Returns:
+            ChipDistribution（source="baostock_local"），失败返回 None
+            （manager 会继续尝试下一数据源；本 fetcher 已是链尾，
+            返回 None 后 pipeline 记录“筹码分布获取失败或已禁用”并继续主流程）。
+        """
+        try:
+            code = normalize_stock_code(stock_code)
+        except Exception as e:
+            logger.warning(f"Baostock 筹码分布: 代码规范化失败 {stock_code}: {e}")
+            return None
+        # 仅 A 股：美股/港股/北交所不走本路径（与 _fetch_raw_data 的守卫一致）
+        if _is_us_code(code) or _is_hk_market(code) or is_bse_code(code):
+            return None
+        try:
+            bs_code = self._convert_stock_code(code)
+            end = datetime.now()
+            start = end - timedelta(days=self.CHIP_HISTORY_CALENDAR_DAYS)
+            with self._baostock_session() as bs:
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,turn,tradestatus",
+                    start_date=start.strftime("%Y-%m-%d"),
+                    end_date=end.strftime("%Y-%m-%d"),
+                    frequency="d",
+                    adjustflag="2",  # 2=前复权，筹码成本必须用复权价
+                )
+                if rs.error_code != "0":
+                    logger.warning(f"Baostock 筹码分布查询失败 {code}: {rs.error_msg}")
+                    return None
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    logger.warning(f"Baostock 筹码分布无数据 {code}")
+                    return None
+                df = pd.DataFrame(rows, columns=rs.fields)
+            for col in ("open", "high", "low", "close", "turn"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df[df["tradestatus"] == "1"]  # 停牌日不参与换手衰减
+            df = df.sort_values("date").reset_index(drop=True)
+            if len(df) < self.CHIP_MIN_TRADING_DAYS:
+                logger.warning(
+                    f"Baostock 筹码分布有效交易日不足 {code}: {len(df)} < {self.CHIP_MIN_TRADING_DAYS}"
+                )
+                return None
+            result = _chip_distribution_local(
+                df, grid_size=self.CHIP_GRID_SIZE, decay=self.CHIP_DECAY
+            )
+        except Exception as e:
+            logger.warning(f"Baostock 筹码分布失败 {code}: {e}")
+            return None
+
+        latest_date = str(df["date"].iloc[-1])
+        logger.info(
+            f"Baostock 筹码分布(本地推演) {code} {latest_date}: "
+            f"获利比例={result['profit_ratio']:.1%}, 平均成本={result['avg_cost']:.2f}, "
+            f"筹码峰={result['peak_price']:.2f}"
+        )
+        return ChipDistribution(
+            code=code,
+            date=latest_date,
+            source="baostock_local",
+            profit_ratio=result["profit_ratio"],
+            avg_cost=result["avg_cost"],
+            cost_90_low=result["cost_90"][0],
+            cost_90_high=result["cost_90"][1],
+            concentration_90=result["concentration_90"],
+            cost_70_low=result["cost_70"][0],
+            cost_70_high=result["cost_70"][1],
+            concentration_70=result["concentration_70"],
+        )
 
 
 if __name__ == "__main__":

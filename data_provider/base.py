@@ -1864,6 +1864,14 @@ class DataFetcherManager:
         else:
             logger.debug("[data source init] skip MiaoxiangFetcher because MX_APIKEY is not configured")
 
+        # 新浪资金流补充源（a-stock-data fund_flow_backup 移植，Apache 2.0）：
+        # 免费、无 key、无需配置；仅在主链路（东财 AKShare）与妙想均未拿到
+        # stock_flow 时，由 _supplement_capital_flow_from_fetchers 兜底调用。
+        # priority 7：排在妙想（6）之后，付费源优先、免费源最后。
+        from .sina_fund_flow_fetcher import SinaFundFlowFetcher
+
+        optional_fetchers.append(SinaFundFlowFetcher())
+
         if LongbridgeFetcher.has_configured_credentials(config):
             optional_fetchers.append(LongbridgeFetcher())  # 长桥（美股/港股兜底，懒加载）
         else:
