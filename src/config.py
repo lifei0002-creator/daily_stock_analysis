@@ -997,6 +997,8 @@ class Config:
     futu_hk_realtime_source_priority: str = "futu,longbridge,akshare,yfinance"
     mx_apikey: Optional[str] = None
     mx_priority: int = 6
+    hithink_api_key: Optional[str] = None
+    hithink_priority: int = 8
     finnhub_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
@@ -1348,7 +1350,7 @@ class Config:
     # - akshare_sina: 新浪财经，基本行情稳定，但无量比
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
-    realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
+    realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em,hithink"
     # 实时行情缓存时间（秒）
     realtime_cache_ttl: int = 600
     # 熔断器冷却时间（秒）
@@ -1930,6 +1932,8 @@ class Config:
             futu_hk_realtime_source_priority=os.getenv('FUTU_HK_REALTIME_SOURCE_PRIORITY', 'futu,longbridge,akshare,yfinance'),
             mx_apikey=os.getenv('MX_APIKEY') or None,
             mx_priority=parse_env_int(os.getenv('MX_PRIORITY'), 6, field_name='MX_PRIORITY', minimum=0),
+            hithink_api_key=os.getenv('HITHINK_API_KEY') or None,
+            hithink_priority=parse_env_int(os.getenv('HITHINK_PRIORITY'), 8, field_name='HITHINK_PRIORITY', minimum=0),
             finnhub_api_key=os.getenv('FINNHUB_API_KEY') or None,
             alphavantage_api_key=os.getenv('ALPHAVANTAGE_API_KEY') or None,
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
@@ -3138,7 +3142,7 @@ class Config:
         so that the paid data source is utilized for realtime quotes as well.
         """
         explicit = os.getenv('REALTIME_SOURCE_PRIORITY')
-        default_priority = 'tencent,akshare_sina,efinance,akshare_em'
+        default_priority = 'tencent,akshare_sina,efinance,akshare_em,hithink'
 
         if explicit:
             # User explicitly set priority, respect it
