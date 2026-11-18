@@ -1872,6 +1872,22 @@ class DataFetcherManager:
 
         optional_fetchers.append(SinaFundFlowFetcher())
 
+        # 同花顺 Financial-API 兜底源（官方 hithink-finance，需配 HITHINK_API_KEY）：
+        # 实时行情快照（+ 估值补 PE/PB）、基本面 bundle、龙虎榜 flag 三处兜底；
+        # 无 Key 时不注册，行为与今天完全一致。
+        hithink_api_key = (getattr(config, "hithink_api_key", None) or "").strip()
+        if hithink_api_key:
+            from .hithink_fetcher import HithinkFetcher
+
+            optional_fetchers.append(
+                HithinkFetcher(
+                    api_key=hithink_api_key,
+                    priority=getattr(config, "hithink_priority", 8),
+                )
+            )
+        else:
+            logger.debug("[data source init] skip HithinkFetcher because HITHINK_API_KEY is not configured")
+
         if LongbridgeFetcher.has_configured_credentials(config):
             optional_fetchers.append(LongbridgeFetcher())  # 长桥（美股/港股兜底，懒加载）
         else:
@@ -2699,6 +2715,16 @@ class DataFetcherManager:
                             operation="get_realtime_quote",
                         )
                         quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
+
+                elif source == "hithink":
+                    fetcher = self._get_fetcher_by_name("HithinkFetcher", capability="realtime_quote")
+                    if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):
+                        record_provider_run_started(
+                            data_type="realtime_quote",
+                            provider=fetcher.name,
+                            operation="get_realtime_quote",
+                        )
+                        quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code)
 
                 provider_name = fetcher.name if fetcher is not None else source
                 if analysis_target is not None and quote is not None and not self._quote_matches_target(quote, analysis_target):
@@ -4457,6 +4483,50 @@ class DataFetcherManager:
         else:
             institution_payload = dict(institution_payload)
 
+        # Hithink 基本面补充（同花顺 Financial-API）：AKShare bundle 的 growth 与
+        # earnings 同时为空时才补，按块填空、不覆盖已有非空块；预算取剩余
+        # remaining_seconds，超时即放弃，fail-open。
+        if (
+            not self._has_meaningful_payload(growth_payload)
+            and not self._earnings_block_has_values(earnings_payload)
+            and remaining_seconds > 0
+        ):
+            hithink_fetcher = self._get_fetcher_by_name("HithinkFetcher")
+            if hithink_fetcher is not None and callable(
+                getattr(hithink_fetcher, "get_fundamental_bundle", None)
+            ):
+                supplement, sup_err, sup_cost_ms = self._run_with_timeout(
+                    lambda: hithink_fetcher.get_fundamental_bundle(stock_code),
+                    remaining_seconds,
+                    "fundamental_bundle_hithink",
+                    quarantine_key=("HithinkFetcher", "fundamental_bundle"),
+                )
+                _consume_budget(sup_cost_ms)
+                if isinstance(supplement, dict) and (
+                    supplement.get("growth") or supplement.get("earnings")
+                ):
+                    growth_payload, earnings_payload, institution_payload, filled = (
+                        self._merge_fundamental_bundle(
+                            growth_payload, earnings_payload, institution_payload, supplement
+                        )
+                    )
+                    if filled:
+                        bundle_chain.extend(
+                            self._normalize_source_chain(
+                                supplement.get("source_chain", []),
+                                "fundamental_bundle",
+                                str(supplement.get("status", "partial")),
+                                sup_cost_ms,
+                            )
+                        )
+                        bundle_errors.extend(supplement.get("errors", []))
+                        logger.info(
+                            "Hithink 基本面补充 %s: 已补 %s",
+                            stock_code, "、".join(filled),
+                        )
+                elif sup_err:
+                    bundle_errors.append(f"HithinkFetcher: {sup_err}")
+
         # Derive TTM dividend yield from already-fetched quote price; avoid extra quote calls.
         earnings_extra_errors: List[str] = []
         dividend_payload = earnings_payload.get("dividend")
@@ -4607,6 +4677,32 @@ class DataFetcherManager:
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
+
+    @staticmethod
+    def _merge_fundamental_bundle(growth, earnings, institution, supplement):
+        """按块填空合并 Hithink bundle：只填 AKShare 留空的块，不覆盖已有内容。
+
+        按块（非按字段）填空：某块只要已有任一有效值就整块保留，
+        与资金流补充“主链路空才补”的口径一致。
+        Returns (growth, earnings, institution, filled_block_names).
+        """
+        filled = []
+        if not DataFetcherManager._has_meaningful_payload(growth):
+            sup_growth = supplement.get("growth")
+            if isinstance(sup_growth, dict) and DataFetcherManager._has_meaningful_payload(sup_growth):
+                growth = dict(sup_growth)
+                filled.append("growth")
+        if not DataFetcherManager._earnings_block_has_values(earnings):
+            sup_earnings = supplement.get("earnings")
+            if isinstance(sup_earnings, dict) and DataFetcherManager._earnings_block_has_values(sup_earnings):
+                earnings = dict(sup_earnings)
+                filled.append("earnings")
+        if not DataFetcherManager._has_meaningful_payload(institution):
+            sup_institution = supplement.get("institution")
+            if isinstance(sup_institution, dict) and DataFetcherManager._has_meaningful_payload(sup_institution):
+                institution = dict(sup_institution)
+                filled.append("institution")
+        return growth, earnings, institution, filled
 
     def _supplement_capital_flow_from_fetchers(
         self,
@@ -4774,31 +4870,82 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
+        # Hithink 龙虎榜补充（同花顺 Financial-API）：照抄资金流的 60/40 分账。
+        # 仅当 AKShare 完全答不上来（not_supported/failed）时才补；
+        # AKShare 明确答复“未上榜”是有效阴性结论，不调 Hithink。
+        hithink_fetcher = None
+        candidate = self._get_fetcher_by_name("HithinkFetcher")
+        if candidate is not None and callable(getattr(candidate, "get_dragon_tiger_flag", None)):
+            hithink_fetcher = candidate
+        adapter_budget = timeout * 0.6 if (timeout > 0 and hithink_fetcher is not None) else timeout
         payload, err, cost_ms = self._run_with_retry(
             lambda: self._fundamental_adapter.get_dragon_tiger_flag(stock_code),
-            timeout,
+            adapter_budget,
             "dragon_tiger",
             quarantine_key=("akshare", "dragon_tiger"),
         )
         if not isinstance(payload, dict):
+            adapter_crashed = True
+            payload = {
+                "status": "failed",
+                "is_on_list": False,
+                "recent_count": 0,
+                "latest_date": None,
+                "source_chain": [],
+                "errors": [err or "dragon_tiger failed"],
+            }
+        else:
+            adapter_crashed = False
+        total_cost_ms = cost_ms
+        supplement_used = False
+        if (
+            hithink_fetcher is not None
+            and str(payload.get("status", "")) in ("not_supported", "failed")
+        ):
+            remaining_budget = max(0.0, timeout - cost_ms / 1000.0)
+            if remaining_budget > 0:
+                supplement, sup_err, sup_cost_ms = self._run_with_timeout(
+                    lambda: hithink_fetcher.get_dragon_tiger_flag(stock_code),
+                    remaining_budget,
+                    "dragon_tiger_hithink",
+                    quarantine_key=("HithinkFetcher", "dragon_tiger"),
+                )
+                total_cost_ms += sup_cost_ms
+                if isinstance(supplement, dict) and str(supplement.get("status", "")) in ("ok", "partial"):
+                    supplement_used = True
+                    payload = {
+                        "status": supplement.get("status"),
+                        "is_on_list": bool(supplement.get("is_on_list", False)),
+                        "recent_count": int(supplement.get("recent_count", 0) or 0),
+                        "latest_date": supplement.get("latest_date"),
+                        "source_chain": list(payload.get("source_chain", []))
+                        + list(supplement.get("source_chain", [])),
+                        "errors": list(payload.get("errors", []))
+                        + list(supplement.get("errors", [])),
+                    }
+                elif sup_err:
+                    payload.setdefault("errors", []).append(f"HithinkFetcher: {sup_err}")
+        if adapter_crashed and not supplement_used:
+            # 保持原有 failed 语义（空 data），与补充未接入时完全一致。
+            # payload["errors"] 已含 [err or "dragon_tiger failed"]，不再重复追加 err。
             return self._build_fundamental_block(
                 "failed",
                 {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "dragon_tiger failed"],
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": total_cost_ms}],
+                list(payload.get("errors", [])),
             )
         return self._build_fundamental_block(
             (payload.get("status") if isinstance(payload.get("status"), str) else "partial"),
             {
                 "is_on_list": bool(payload.get("is_on_list", False)),
-                "recent_count": int(payload.get("recent_count", 0)),
+                "recent_count": int(payload.get("recent_count", 0) or 0),
                 "latest_date": payload.get("latest_date"),
             },
             self._normalize_source_chain(
                 payload.get("source_chain", []),
                 "dragon_tiger",
                 str(payload.get("status", "ok")),
-                cost_ms,
+                total_cost_ms,
             ),
             list(payload.get("errors", [])) + ([err] if err else []),
         )
