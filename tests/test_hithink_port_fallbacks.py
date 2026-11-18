@@ -518,6 +518,21 @@ class RegistrationTest(unittest.TestCase):
         self.assertTrue(fetcher.is_available_for_request("realtime_quote"))
         self.assertFalse(fetcher.is_available_for_request("daily_data"))
 
+    def test_empty_priority_env_falls_back_to_default(self):
+        # run #14 实测：工作流里 vars.HITHINK_PRIORITY 未设置时展开成空字符串，
+        # int('') 在导入 HithinkFetcher 时直接崩掉整次运行。空值/空白必须回落到 8。
+        import importlib
+
+        import data_provider.hithink_fetcher as mod
+
+        for raw in ("", "   "):
+            with mock.patch.dict(os.environ, {"HITHINK_PRIORITY": raw}):
+                reloaded = importlib.reload(mod)
+            try:
+                self.assertEqual(reloaded.HithinkFetcher.priority, 8)
+            finally:
+                importlib.reload(mod)
+
     def test_not_registered_without_key(self):
         manager = self._manager_with_env({})
         self.assertIsNone(manager._get_fetcher_by_name("HithinkFetcher"))
