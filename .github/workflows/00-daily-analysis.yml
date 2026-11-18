@@ -334,7 +334,7 @@ jobs:
           MX_APIKEY: ${{ secrets.MX_APIKEY }}
           MX_PRIORITY: ${{ vars.MX_PRIORITY || secrets.MX_PRIORITY }}
           HITHINK_API_KEY: ${{ secrets.HITHINK_API_KEY }}
-          HITHINK_PRIORITY: ${{ vars.HITHINK_PRIORITY || secrets.HITHINK_PRIORITY }}
+          HITHINK_PRIORITY: ${{ vars.HITHINK_PRIORITY || '8' }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
