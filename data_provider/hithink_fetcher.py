@@ -177,7 +177,10 @@ class HithinkFetcher(BaseFetcher):
     """
 
     name = "HithinkFetcher"
-    priority = int(os.getenv("HITHINK_PRIORITY", "8"))
+    # HITHINK_PRIORITY 为空字符串时回落到 8：工作流里 vars 未设置会展开成
+    # 空字符串传进来，int('') 会在导入时直接崩掉整次运行（run #14 实测）。
+    _priority_raw = (os.getenv("HITHINK_PRIORITY") or "8").strip()
+    priority = int(_priority_raw or "8")
 
     def __init__(self, api_key: str = "", priority: Optional[int] = None) -> None:
         """初始化。api_key 为空时本 fetcher 全程禁用（不发任何请求）。"""
